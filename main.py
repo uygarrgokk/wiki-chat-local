@@ -43,11 +43,21 @@ def run() -> None:
         if user_input == "/ingest":
             print("Ingesting Wikipedia data...")
             rows = build_local_corpus()
+            if not rows:
+                print(
+                    "Ingestion produced 0 chunks. Likely Wikipedia rate-limit (HTTP 429)."
+                )
+                print("Wait a minute, then run /ingest again.")
+                continue
             store.upsert_rows(rows)
             print(f"Ingestion completed. Stored {len(rows)} chunks.")
             continue
 
-        context, sources = retrieve_context(store, user_input)
+        try:
+            context, sources = retrieve_context(store, user_input)
+        except RuntimeError as exc:
+            print(f"Assistant> {exc}")
+            continue
         answer = generate_answer(user_input, context)
         print(f"Assistant> {answer}")
 

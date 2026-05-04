@@ -3,6 +3,7 @@ from typing import Any, List, cast
 import chromadb
 from chromadb.api.types import Metadata, Where
 from sentence_transformers import SentenceTransformer
+import shutil
 
 from chunk_row import ChunkRow
 from config import CHROMA_DIR, EMBEDDING_MODEL
@@ -20,6 +21,17 @@ class LocalVectorStore:
             self.client.delete_collection("wiki_chunks")
         except Exception:
             pass
+        try:
+            self.collection = self.client.get_or_create_collection(name="wiki_chunks")
+            _ = self.collection.count()
+            return
+        except Exception:
+            pass
+
+        # If Chroma index files are corrupted, recreate storage from scratch.
+        shutil.rmtree(CHROMA_DIR, ignore_errors=True)
+        CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+        self.client = chromadb.PersistentClient(path=str(CHROMA_DIR))
         self.collection = self.client.get_or_create_collection(name="wiki_chunks")
 
     def upsert_rows(self, rows: List[ChunkRow]) -> None:
@@ -59,8 +71,13 @@ class LocalVectorStore:
                 Where,
                 {"$or": [cast(Where, {"entity_type": t}) for t in entity_filters]},
             )
-        return self.collection.query(
-            query_embeddings=query_embedding,
-            n_results=top_k,
-            where=where,
-        )
+        try:
+            return self.collection.query(
+                query_embeddings=query_embedding,
+                n_results=top_k,
+                where=where,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Vector index is unreadable. Run /reset and then /ingest."
+            ) from exc

@@ -1,5 +1,6 @@
 import sqlite3
-from typing import List, Tuple
+import time
+from typing import Dict, List, Tuple
 
 import requests
 from tqdm import tqdm
@@ -50,6 +51,12 @@ def init_sqlite() -> sqlite3.Connection:
     return conn
 
 
+def clear_sqlite(conn: sqlite3.Connection) -> None:
+    conn.execute("DELETE FROM chunks")
+    conn.execute("DELETE FROM docs")
+    conn.commit()
+
+
 def fetch_wikipedia_extract(title: str) -> Tuple[str, str]:
     params = {
         "action": "query",
@@ -59,34 +66,76 @@ def fetch_wikipedia_extract(title: str) -> Tuple[str, str]:
         "redirects": 1,
         "titles": title,
     }
-    response = requests.get(
-        WIKIPEDIA_API, params=params, headers=WIKIPEDIA_HEADERS, timeout=30
-    )
-    response.raise_for_status()
-    data = response.json()
-    pages = data["query"]["pages"]
-    page = next(iter(pages.values()))
-    extract = page.get("extract", "")
-    page_title = page.get("title", title)
-    source_url = f"https://en.wikipedia.org/wiki/{page_title.replace(' ', '_')}"
-    return extract, source_url
+    last_exc: Exception | None = None
+    for attempt in range(6):
+        try:
+            response = requests.get(
+                WIKIPEDIA_API, params=params, headers=WIKIPEDIA_HEADERS, timeout=30
+            )
+            response.raise_for_status()
+            data = response.json()
+            pages = data["query"]["pages"]
+            page = next(iter(pages.values()))
+            extract = page.get("extract", "")
+            page_title = page.get("title", title)
+            source_url = f"https://en.wikipedia.org/wiki/{page_title.replace(' ', '_')}"
+            return extract, source_url
+        except requests.HTTPError as exc:
+            last_exc = exc
+            status = exc.response.status_code if exc.response is not None else None
+            # Retry only for temporary rate-limit/server issues.
+            if status not in (429, 500, 502, 503, 504) or attempt == 5:
+                raise
+            time.sleep(1.0 * (attempt + 1))
+        except requests.RequestException as exc:
+            last_exc = exc
+            if attempt == 5:
+                raise
+            time.sleep(1.0 * (attempt + 1))
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("Wikipedia fetch failed for unknown reason.")
 
 
-def build_local_corpus() -> List[ChunkRow]:
+def build_local_corpus(verbose: bool = False) -> List[ChunkRow]:
     ensure_dirs()
     conn = init_sqlite()
+    clear_sqlite(conn)
     rows: List[ChunkRow] = []
+    stats: Dict[str, int] = {
+        "person_success": 0,
+        "place_success": 0,
+        "person_failed": 0,
+        "place_failed": 0,
+    }
 
     worklist = [("person", p) for p in PEOPLE] + [("place", p) for p in PLACES]
+    if verbose:
+        print(f"Starting ingestion of {len(worklist)} entities...")
+
     for entity_type, title in tqdm(worklist, desc="Ingesting Wikipedia pages"):
+        if verbose:
+            print(f"Fetching: {title}...")
         try:
             text, source_url = fetch_wikipedia_extract(title)
-        except Exception:
+        except Exception as exc:
+            stats[f"{entity_type}_failed"] += 1
+            if verbose:
+                print(f"Failed to ingest {title}: {exc}")
             continue
         if not text.strip():
+            stats[f"{entity_type}_failed"] += 1
+            if verbose:
+                print(f"Failed to ingest {title}: empty extract")
             continue
 
         chunks = chunk_text(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP)
+        if not chunks:
+            stats[f"{entity_type}_failed"] += 1
+            if verbose:
+                print(f"Failed to ingest {title}: no chunks produced")
+            continue
+
         conn.execute(
             """
             INSERT OR REPLACE INTO docs(title, entity_type, source_url, text_length)
@@ -112,6 +161,21 @@ def build_local_corpus() -> List[ChunkRow]:
                 "text": ch,
             }
             rows.append(row)
+        stats[f"{entity_type}_success"] += 1
+        if verbose:
+            print(f"Successfully ingested {title} ({len(chunks)} chunks).")
+
     conn.commit()
     conn.close()
+    if verbose:
+        print("\nIngestion summary")
+        print(
+            "People: "
+            f"{stats['person_success']} success / {stats['person_failed']} failed"
+        )
+        print(
+            "Places: "
+            f"{stats['place_success']} success / {stats['place_failed']} failed"
+        )
+        print(f"Total chunks prepared: {len(rows)}")
     return rows
