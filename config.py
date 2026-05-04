@@ -14,3 +14,8 @@ CHUNK_OVERLAP = 120
 TOP_K = 5
 
 WIKIPEDIA_API = "https://en.wikipedia.org/w/api.php"
+# Wikipedia requires a descriptive User-Agent; requests without it often get HTTP 403.
+WIKIPEDIA_HEADERS = {
+    "User-Agent": "BLG483E-LocalWikipediaRAG/1.0 (course homework; Python requests)",
+    "Accept": "application/json",
+}

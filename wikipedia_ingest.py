@@ -1,12 +1,20 @@
 import sqlite3
-from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import List, Tuple
 
 import requests
 from tqdm import tqdm
 
 from chunking import chunk_text
-from config import CHUNK_OVERLAP, CHUNK_SIZE, DATA_DIR, SQLITE_PATH, WIKIPEDIA_API
+from config import (
+    CHUNK_OVERLAP,
+    CHUNK_SIZE,
+    DATA_DIR,
+    SQLITE_PATH,
+    WIKIPEDIA_API,
+    WIKIPEDIA_HEADERS,
+)
+
+from chunk_row import ChunkRow
 from entities import PEOPLE, PLACES
 
 
@@ -51,7 +59,9 @@ def fetch_wikipedia_extract(title: str) -> Tuple[str, str]:
         "redirects": 1,
         "titles": title,
     }
-    response = requests.get(WIKIPEDIA_API, params=params, timeout=30)
+    response = requests.get(
+        WIKIPEDIA_API, params=params, headers=WIKIPEDIA_HEADERS, timeout=30
+    )
     response.raise_for_status()
     data = response.json()
     pages = data["query"]["pages"]
@@ -62,10 +72,10 @@ def fetch_wikipedia_extract(title: str) -> Tuple[str, str]:
     return extract, source_url
 
 
-def build_local_corpus() -> List[Dict[str, str]]:
+def build_local_corpus() -> List[ChunkRow]:
     ensure_dirs()
     conn = init_sqlite()
-    rows: List[Dict[str, str]] = []
+    rows: List[ChunkRow] = []
 
     worklist = [("person", p) for p in PEOPLE] + [("place", p) for p in PLACES]
     for entity_type, title in tqdm(worklist, desc="Ingesting Wikipedia pages"):
@@ -93,16 +103,15 @@ def build_local_corpus() -> List[Dict[str, str]]:
                 """,
                 (chunk_id, title, entity_type, idx, ch),
             )
-            rows.append(
-                {
-                    "id": chunk_id,
-                    "title": title,
-                    "entity_type": entity_type,
-                    "source_url": source_url,
-                    "chunk_index": idx,
-                    "text": ch,
-                }
-            )
+            row: ChunkRow = {
+                "id": chunk_id,
+                "title": title,
+                "entity_type": entity_type,
+                "source_url": source_url,
+                "chunk_index": idx,
+                "text": ch,
+            }
+            rows.append(row)
     conn.commit()
     conn.close()
     return rows
