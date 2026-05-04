@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Local databases and generated artifacts
+db/
+data/
+
+# IDE/system
+.DS_Store
+Thumbs.db
