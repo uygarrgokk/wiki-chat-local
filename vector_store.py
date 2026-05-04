@@ -52,12 +52,22 @@ class LocalVectorStore:
             )
             for r in rows
         ]
-        self.collection.upsert(
-            ids=ids,
-            embeddings=embeddings,
-            documents=texts,
-            metadatas=metadatas,
-        )
+        try:
+            self.collection.upsert(
+                ids=ids,
+                embeddings=embeddings,
+                documents=texts,
+                metadatas=metadatas,
+            )
+        except Exception:
+            # Recover from broken on-disk hnsw index and retry once.
+            self.reset()
+            self.collection.upsert(
+                ids=ids,
+                embeddings=embeddings,
+                documents=texts,
+                metadatas=metadatas,
+            )
 
     def query(
         self, query_text: str, top_k: int, entity_filters: List[str]
