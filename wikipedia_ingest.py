@@ -65,6 +65,7 @@ def fetch_wikipedia_extract(title: str) -> Tuple[str, str]:
         "explaintext": 1,
         "redirects": 1,
         "titles": title,
+        
     }
     last_exc: Exception | None = None
     for attempt in range(6):
