@@ -57,6 +57,13 @@ def clear_sqlite(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _retry_delay(response: requests.Response | None, attempt: int) -> float:
+    retry_after = response.headers.get("Retry-After", "") if response is not None else ""
+    if retry_after.isdigit():
+        return min(float(retry_after), 60.0)
+    return min(2.0 * 2**attempt, 30.0)
+
+
 def fetch_wikipedia_extract(title: str) -> Tuple[str, str]:
     params = {
         "action": "query",
@@ -87,7 +94,7 @@ def fetch_wikipedia_extract(title: str) -> Tuple[str, str]:
             # Retry only for temporary rate-limit/server issues.
             if status not in (429, 500, 502, 503, 504) or attempt == 5:
                 raise
-            time.sleep(1.0 * (attempt + 1))
+            time.sleep(_retry_delay(exc.response, attempt))
         except requests.RequestException as exc:
             last_exc = exc
             if attempt == 5:
@@ -114,20 +121,43 @@ def build_local_corpus(verbose: bool = False) -> List[ChunkRow]:
     if verbose:
         print(f"Starting ingestion of {len(worklist)} entities...")
 
+    fetched: List[Tuple[str, str, str, str]] = []
+    failed: List[Tuple[str, str]] = []
     for entity_type, title in tqdm(worklist, desc="Ingesting Wikipedia pages"):
         if verbose:
             print(f"Fetching: {title}...")
         try:
             text, source_url = fetch_wikipedia_extract(title)
         except Exception as exc:
-            stats[f"{entity_type}_failed"] += 1
+            failed.append((entity_type, title))
             if verbose:
                 print(f"Failed to ingest {title}: {exc}")
             continue
+        fetched.append((entity_type, title, text, source_url))
+
+    # Rate limits are usually over after a short pause; one slower second pass
+    # recovers most pages that the first pass dropped.
+    if failed:
+        print(f"Retrying {len(failed)} failed page(s) after a pause...")
+        time.sleep(10)
+        retry, failed = failed, []
+        for entity_type, title in retry:
+            try:
+                text, source_url = fetch_wikipedia_extract(title)
+            except Exception:
+                failed.append((entity_type, title))
+                continue
+            fetched.append((entity_type, title, text, source_url))
+            time.sleep(1)
+    for entity_type, _ in failed:
+        stats[f"{entity_type}_failed"] += 1
+    if failed:
+        print("WARNING: not ingested: " + ", ".join(t for _, t in failed))
+
+    for entity_type, title, text, source_url in fetched:
         if not text.strip():
             stats[f"{entity_type}_failed"] += 1
-            if verbose:
-                print(f"Failed to ingest {title}: empty extract")
+            print(f"WARNING: not ingested (empty page): {title}")
             continue
 
         chunks = chunk_text(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP)

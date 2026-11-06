@@ -58,7 +58,7 @@ class EvidenceBook:
         return out
 
     def topics(self) -> list[tuple[str, str]]:
-        return list({(h.title, h.entity_type) for h in self._order})
+        return list(dict.fromkeys((h.title, h.entity_type) for h in self._order))
 
 
 class ReActAgent:
@@ -77,17 +77,22 @@ class ReActAgent:
     # -- public ---------------------------------------------------------------
     def run(self, question: str, session_id: str) -> AgentResult:
         memory_ctx = self.memory.build_context(session_id)
-        task, sub_questions = self._decompose(question, memory_ctx)
+        route, task, sub_questions = self._decompose(question, memory_ctx)
+        if route == "chat":
+            answer = self._chat(question)
+            self._remember(session_id, question, answer, [])
+            return AgentResult(answer=answer, thinking="Small talk: no Wikipedia search needed.")
+
         book = EvidenceBook()
         steps = self._seed_entities(f"{question} {task}", book)
         steps = self._react_loop(task, sub_questions, memory_ctx, book, steps)
 
-        thinking, draft = self._synthesize(task, sub_questions, book, memory_ctx)
+        thinking, draft, facts = self._synthesize(task, sub_questions, book, memory_ctx)
         answer, corrected = draft, False
         if self.self_correct and len(book):
-            answer, corrected = self._verify(task, draft, book)
+            answer, corrected = self._verify(task, draft, facts, book)
 
-        self._remember(session_id, question, answer, book)
+        self._remember(session_id, question, answer, self._topics(steps, book))
         return AgentResult(
             answer=answer,
             thinking=thinking,
@@ -98,17 +103,37 @@ class ReActAgent:
         )
 
     # -- phases ---------------------------------------------------------------
-    def _decompose(self, question: str, memory_ctx: str) -> tuple[str, list[str]]:
+    def _decompose(self, question: str, memory_ctx: str) -> tuple[str, str, list[str]]:
         raw = self.llm.chat(
             prompts.DECOMPOSE_SYSTEM, prompts.decompose_user(question, memory_ctx), json_mode=True
         )
         data = parse_json(raw) or {}
+        route = "chat" if str(data.get("route", "")).strip().lower() == "chat" else "wiki"
+        if route == "chat" and not _CHATTY.search(question):
+            route = "wiki"  # factual questions must stay grounded, even odd ones
         task = str(data.get("standalone_question") or question).strip() or question
         subs = data.get("sub_questions")
         if not isinstance(subs, list):
             subs = []
         cleaned = [str(s).strip() for s in subs if str(s).strip()][:MAX_SUB_QUESTIONS]
-        return task, cleaned or [task]
+        if self._hijacked(question, task + " " + " ".join(cleaned)):
+            task, cleaned = question, []
+        task = self.retriever.canonicalize(task)
+        cleaned = [self.retriever.canonicalize(s) for s in cleaned]
+        return route, task, cleaned or [task]
+
+    def _hijacked(self, question: str, rewrite: str) -> bool:
+        """Small models replace an unrelated message with the memory's topic
+        ("do you know Turkish" -> "Who is Albert Einstein?"). A rewrite may only add
+        entities when the message refers back with a pronoun."""
+        if _REFERS_BACK.search(question):
+            return False
+        asked = set(self.retriever.find_entities(question))
+        return bool(set(self.retriever.find_entities(rewrite)) - asked)
+
+    def _chat(self, question: str) -> str:
+        titles = ", ".join(title for title, _ in self.retriever.titles())
+        return self.llm.chat(prompts.CHAT_SYSTEM.format(titles=titles or "(none yet)"), question)
 
     def _seed_entities(self, text: str, book: EvidenceBook) -> list[Step]:
         """Name-only searches rank article trivia as high as the intro, because every
@@ -137,11 +162,14 @@ class ReActAgent:
         steps: list[Step],
     ) -> list[Step]:
         steps = list(steps)
-        tried = {(s.action, s.action_input.lower()) for s in steps}
+        tried = {_action_key(s.action, s.action_input) for s in steps}
+        titles = [title for title, _ in self.retriever.titles()]
         for _ in range(self.max_steps):
             raw = self.llm.chat(
                 prompts.REACT_SYSTEM,
-                prompts.react_user(task, sub_questions, memory_ctx, self._scratchpad(steps)),
+                prompts.react_user(
+                    task, sub_questions, memory_ctx, self._scratchpad(steps), titles
+                ),
                 json_mode=True,
             )
             data = parse_json(raw) or {}
@@ -156,18 +184,33 @@ class ReActAgent:
                     steps.append(Step(thought, action, arg, "Research finished."))
                     break
                 action, arg = "search_wiki", task  # never answer with zero evidence
-            if (action, arg.lower()) in tried:
+            if action == "lookup_entity":
+                action, arg = self._resolve_lookup(arg or task)
+            key = _action_key(action, arg or task)
+            if key in tried and _action_key("search_wiki", task) not in tried:
+                action, arg = "search_wiki", task  # repeated a lookup: search the task once
+                key = _action_key(action, arg)
+            if key in tried:
                 steps.append(Step(thought, action, arg, "Already tried; stopping research."))
                 break
-            tried.add((action, arg.lower()))
+            tried.add(key)
+            before = len(book)
             steps.append(Step(thought, action, arg, self._act(action, arg or task, book)))
+            if before and len(book) == before:  # nothing new: more searching won't help
+                break
         if not len(book):  # last resort so synthesis always has a chance
             self._act("search_wiki", task, book)
         return steps
 
+    def _resolve_lookup(self, arg: str) -> tuple[str, str]:
+        """The model often passes a question ("where was einstein born") to
+        lookup_entity; map it to a real title, otherwise run it as a search."""
+        matches = self.retriever.find_entities(arg)
+        return ("lookup_entity", matches[0]) if matches else ("search_wiki", arg)
+
     def _act(self, action: str, arg: str, book: EvidenceBook) -> str:
         if action == "lookup_entity":
-            hits = lookup_title(arg, limit=FINAL_TOP_K)
+            hits = lookup_title(arg, limit=FINAL_TOP_K, exact=True)
         else:
             hits = self.retriever.search(arg, top_k=FINAL_TOP_K)
         if not hits:
@@ -182,25 +225,34 @@ class ReActAgent:
 
     def _synthesize(
         self, task: str, sub_questions: list[str], book: EvidenceBook, memory_ctx: str
-    ) -> tuple[str, str]:
+    ) -> tuple[str, str, list[str]]:
         if not len(book):
-            return "No evidence was retrieved.", prompts.NOT_FOUND
+            return "No evidence was retrieved.", prompts.NOT_FOUND, []
         raw = self.llm.chat(
             prompts.SYNTHESIS_SYSTEM,
             prompts.synthesis_user(task, sub_questions, book.render(), memory_ctx),
             json_mode=True,  # 3B models skip free-text tags but keep JSON keys
         )
         data = parse_json(raw)
-        if data is None or not str(data.get("answer", "")).strip():
-            return parse_thinking_answer(raw)
+        if data is None:
+            if raw.lstrip().startswith("{"):  # truncated JSON: never show it to the user
+                return raw, prompts.NOT_FOUND, []
+            return (*parse_thinking_answer(raw), [])
         facts = data.get("relevant_facts")
-        facts = [str(f) for f in facts] if isinstance(facts, list) else []
+        facts = [str(f).strip() for f in facts if str(f).strip()] if isinstance(facts, list) else []
         thinking = str(data.get("thinking", "")).strip()
+        if thinking in ("...", "") or thinking.startswith("step-by-step:"):
+            thinking = ""
         if facts:
             thinking += "\nRelevant facts:\n" + "\n".join(f"- {f}" for f in facts)
-        return thinking.strip(), str(data["answer"]).strip()
+        answer = str(data.get("answer", "")).strip()
+        if not answer:  # model spent its output on the facts; they are evidence quotes
+            answer = " ".join(facts) or prompts.NOT_FOUND
+        return thinking.strip(), answer, facts
 
-    def _verify(self, task: str, draft: str, book: EvidenceBook) -> tuple[str, bool]:
+    def _verify(
+        self, task: str, draft: str, facts: list[str], book: EvidenceBook
+    ) -> tuple[str, bool]:
         evidence = book.render()
         raw = self.llm.chat(
             prompts.VERIFY_SYSTEM, prompts.verify_user(task, draft, evidence), json_mode=True
@@ -211,19 +263,30 @@ class ReActAgent:
             return draft, False
         if is_refusal(revised):
             # Only keep a downgrade to "I don't know" if the draft was not grounded.
-            if is_refusal(draft) or not is_grounded(draft, evidence):
-                return prompts.NOT_FOUND, not is_refusal(draft)
-            return draft, False
+            if is_refusal(draft) or is_grounded(draft, evidence):
+                return draft, False
+            # The draft mixed in unsupported claims; the quoted facts are still usable.
+            grounded = [f for f in facts if is_grounded(f, evidence)]
+            return (" ".join(grounded) or prompts.NOT_FOUND), True
         if not is_grounded(revised, evidence):  # verifier brought in outside knowledge
             return draft, False
         return revised, True
 
     # -- memory ---------------------------------------------------------------
-    def _remember(self, session_id: str, question: str, answer: str, book: EvidenceBook) -> None:
+    def _remember(
+        self, session_id: str, question: str, answer: str, topics: list[tuple[str, str]]
+    ) -> None:
         self.memory.add_message(session_id, "user", question)
         self.memory.add_message(session_id, "assistant", answer)
-        self.memory.note_topics(session_id, book.topics())
+        self.memory.note_topics(session_id, topics)
         self.memory.compress(session_id, self._summarize)
+
+    def _topics(self, steps: list[Step], book: EvidenceBook) -> list[tuple[str, str]]:
+        """Articles the question was about, not every article a search brushed past."""
+        looked_up = {s.action_input for s in steps if s.action == "lookup_entity"}
+        types = dict(self.retriever.titles())
+        topics = [(t, types[t]) for t in looked_up if t in types]
+        return topics or book.topics()[:1]
 
     def _summarize(self, previous: str, transcript: str) -> str:
         return self.llm.chat(
@@ -238,6 +301,25 @@ class ReActAgent:
             f"Observation: {s.observation}"
             for i, s in enumerate(steps, 1)
         )
+
+
+_REFERS_BACK = re.compile(
+    r"\b(he|she|it|they|him|her|his|hers|its|them|their|there|that|this|those|these"
+    r"|o|onu|onun|orası|orada|burası)\b",
+    re.IGNORECASE,
+)
+
+
+_CHATTY = re.compile(
+    r"\b(you|your|yours|yourself|hi|hello|hey|thanks|thank|bye|goodbye"
+    r"|merhaba|selam|teşekkürler|teşekkür|sağol|sen|siz|seni|sana|senin|sizin|nasılsın)\b",
+    re.IGNORECASE,
+)
+
+
+def _action_key(action: str, arg: str) -> tuple[str, frozenset[str]]:
+    """Paraphrases like "where did X born" / "where was X born" count as repeats."""
+    return action, frozenset(tokenize(arg))
 
 
 def is_refusal(answer: str) -> bool:

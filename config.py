@@ -32,7 +32,7 @@ RERANK_POOL = 15  # fused candidates passed to the cross-encoder
 FINAL_TOP_K = 4  # chunks returned to the agent per search
 
 # ReAct agent
-AGENT_MAX_STEPS = 5
+AGENT_MAX_STEPS = 3
 MAX_SUB_QUESTIONS = 3
 AGENT_TEMPERATURE = 0.1
 OLLAMA_NUM_CTX = 4096

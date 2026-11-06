@@ -19,7 +19,6 @@ from config import (
     SQLITE_PATH,
     USE_RERANKER,
 )
-from retrieval import classify_query
 
 _TOKEN = re.compile(r"\w+")
 _STOPWORDS = frozenset(
@@ -130,18 +129,30 @@ class HybridRetriever:
         self._bm25 = None
         self._titles = None
 
-    def find_entities(self, text: str) -> list[str]:
+    def titles(self) -> list[tuple[str, str]]:
         if self._titles is None:
             self._titles = load_titles()
-        return find_entities(text, self._titles)
+        return self._titles
+
+    def find_entities(self, text: str) -> list[str]:
+        return find_entities(text, self.titles())
+
+    def canonicalize(self, text: str) -> str:
+        return canonicalize_entities(text, self.titles())
 
     def _load_bm25(self) -> BM25Index:
         if self._bm25 is None:
             self._bm25 = BM25Index(load_chunks())
         return self._bm25
 
+    def _filters(self, query: str) -> list[str]:
+        """Entity types of the articles the query names. Keyword hints are not used:
+        "where was Einstein born" is about a person despite "where"."""
+        named = set(self.find_entities(query))
+        return sorted({etype for title, etype in self.titles() if title in named})
+
     def search(self, query: str, top_k: int = FINAL_TOP_K) -> list[Hit]:
-        filters = classify_query(query)
+        filters = self._filters(query)
         lexical = self._load_bm25().search(query, CANDIDATES_PER_RETRIEVER, filters)
         semantic = self._vector_search(query, filters)
         fused = reciprocal_rank_fusion([lexical, semantic])[:RERANK_POOL]
@@ -211,6 +222,29 @@ def load_titles(db_path: Path = SQLITE_PATH) -> list[tuple[str, str]]:
         return []
     finally:
         conn.close()
+
+
+def canonicalize_entities(
+    text: str, titles: list[tuple[str, str]], cutoff: float = 0.8
+) -> str:
+    """Replace misspelled full article names with the title ("albert eistain" ->
+    "Albert Einstein"); otherwise the answer step says no such person exists."""
+    spans = [(m.start(), m.end(), m.group().lower()) for m in _TOKEN.finditer(text)]
+    replacements: list[tuple[int, int, str]] = []
+    for title, _ in titles:
+        target, n = title.lower(), len(title.split())
+        if n == 1 and len(target) < 5:
+            continue
+        for i in range(len(spans) - n + 1):
+            window = " ".join(s[2] for s in spans[i : i + n])
+            if window != target and SequenceMatcher(None, window, target).ratio() >= cutoff:
+                replacements.append((spans[i][0], spans[i + n - 1][1], title))
+    out, last_start = text, len(text) + 1
+    for start, end, title in sorted(replacements, reverse=True):
+        if end <= last_start:  # skip overlapping matches
+            out = out[:start] + title + out[end:]
+            last_start = start
+    return out
 
 
 def find_entities(

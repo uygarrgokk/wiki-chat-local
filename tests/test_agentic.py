@@ -9,7 +9,13 @@ from unittest import mock
 
 from agentic import agent as agent_mod
 from agentic.agent import ReActAgent, is_grounded, parse_thinking_answer
-from agentic.hybrid import BM25Index, HybridRetriever, find_entities, reciprocal_rank_fusion
+from agentic.hybrid import (
+    BM25Index,
+    HybridRetriever,
+    canonicalize_entities,
+    find_entities,
+    reciprocal_rank_fusion,
+)
 from agentic.llm import parse_json
 from agentic.memory import MemoryStore
 from agentic.types import Hit
@@ -138,6 +144,12 @@ class EntityTests(unittest.TestCase):
     def test_unrelated_text(self):
         self.assertEqual(find_entities("what is the weather today", self.TITLES), [])
 
+    def test_canonicalize_fixes_misspelled_names_only(self):
+        self.assertEqual(canonicalize_entities("Who is Albert Eistain?", self.TITLES), "Who is Albert Einstein?")
+        self.assertEqual(canonicalize_entities("who is a. einstein", self.TITLES), "who is Albert Einstein")
+        self.assertEqual(canonicalize_entities("what did tesla invent", self.TITLES), "what did tesla invent")
+        self.assertEqual(canonicalize_entities("Is Mount Everest tall?", self.TITLES), "Is Mount Everest tall?")
+
 
 class SeedingTests(unittest.TestCase):
     def test_intro_seeded_and_refusal_revised(self):
@@ -192,7 +204,133 @@ class GroundingTests(unittest.TestCase):
         self.assertIn("nothing about Musk", result.thinking)
 
 
+def einstein_retriever(store=None):
+    retriever = HybridRetriever(store or FakeStore([]), use_reranker=False)
+    retriever._bm25 = BM25Index([])
+    retriever._titles = [("Albert Einstein", "person"), ("Statue of Liberty", "place")]
+    return retriever
+
+
+class RoutingTests(unittest.TestCase):
+    def test_small_talk_skips_retrieval(self):
+        class ChatLLM(ScriptedLLM):
+            def chat(self, system, user, *, json_mode=False):
+                if "plan research" in system:
+                    return json.dumps({"route": "chat", "standalone_question": user, "sub_questions": []})
+                if "friendly local assistant" in system:
+                    assert "Albert Einstein" in system
+                    return "Evet, Türkçe konuşabilirim."
+                raise AssertionError(f"unexpected call: {system[:40]}")
+
+        mem = MemoryStore(":memory:")
+        result = ReActAgent(ChatLLM(), einstein_retriever(), mem).run("do you know Turkish", "s")
+        self.assertEqual(result.answer, "Evet, Türkçe konuşabilirim.")
+        self.assertEqual(result.steps, [])
+        self.assertEqual(mem.recent_topics("s"), [])
+
+    def test_factual_question_is_never_small_talk(self):
+        class MisroutingLLM(ScriptedLLM):
+            def chat(self, system, user, *, json_mode=False):
+                if "plan research" in system:
+                    return json.dumps({"route": "chat", "standalone_question": "Who is the president of Mars?", "sub_questions": []})
+                if "friendly local assistant" in system:
+                    raise AssertionError("factual question answered without evidence")
+                return super().chat(system, user, json_mode=json_mode)
+
+        agent = ReActAgent(MisroutingLLM(), einstein_retriever(), MemoryStore(":memory:"), self_correct=False)
+        self.assertEqual(agent._decompose("Who is the president of Mars?", "")[0], "wiki")
+
+    def test_rewrite_cannot_inject_memory_topic(self):
+        agent = ReActAgent(ScriptedLLM(), einstein_retriever(), MemoryStore(":memory:"))
+        self.assertTrue(agent._hijacked("do you know Turkish", "Who is Albert Einstein?"))
+        self.assertFalse(agent._hijacked("where was he born", "Where was Albert Einstein born?"))
+        self.assertFalse(agent._hijacked("who is a. einstein", "Who is Albert Einstein?"))
+
+
+class LoopTests(unittest.TestCase):
+    def test_paraphrased_query_counts_as_repeat(self):
+        self.assertEqual(
+            agent_mod._action_key("search_wiki", "where did albert einstein born"),
+            agent_mod._action_key("search_wiki", "where was Albert Einstein born"),
+        )
+
+    def test_loop_stops_when_search_adds_nothing(self):
+        class Searcher(ScriptedLLM):
+            def chat(self, system, user, *, json_mode=False):
+                if "reasoning core" in system:
+                    self.react_calls += 1
+                    return json.dumps({"thought": "more", "action": "search_wiki", "action_input": f"q{self.react_calls} turing"})
+                return super().chat(system, user, json_mode=json_mode)
+
+        llm = Searcher()
+        retriever = HybridRetriever(FakeStore(["a"]), use_reranker=False)
+        retriever._bm25 = BM25Index([])
+        retriever._titles = []
+        ReActAgent(llm, retriever, MemoryStore(":memory:"), max_steps=5).run("Turing?", "s")
+        self.assertEqual(llm.react_calls, 2)  # second search returned only known evidence
+
+    def test_lookup_with_question_maps_to_title(self):
+        agent = ReActAgent(ScriptedLLM(), einstein_retriever(), MemoryStore(":memory:"))
+        self.assertEqual(agent._resolve_lookup("where did albert einstein born"), ("lookup_entity", "Albert Einstein"))
+        self.assertEqual(agent._resolve_lookup("tallest tower"), ("search_wiki", "tallest tower"))
+
+
+class FilterTests(unittest.TestCase):
+    def test_where_question_about_person_is_not_limited_to_places(self):
+        retriever = einstein_retriever()
+        self.assertEqual(retriever._filters("where was Albert Einstein born"), ["person"])
+        self.assertEqual(retriever._filters("where is the tallest tower"), [])
+
+
+class VerifyFallbackTests(unittest.TestCase):
+    def test_ungrounded_draft_falls_back_to_quoted_facts(self):
+        class Mixed(ScriptedLLM):
+            def chat(self, system, user, *, json_mode=False):
+                if "strictly from the numbered" in system:
+                    return json.dumps({
+                        "thinking": "x",
+                        "relevant_facts": ["Turing broke Enigma [E1]"],
+                        "answer": "Turing broke Enigma and later founded Microsoft with Bill Gates.",
+                    })
+                if "fact-checker" in system:
+                    return json.dumps({"verdict": "revise", "final_answer": "I don't know"})
+                return super().chat(system, user, json_mode=json_mode)
+
+        retriever = HybridRetriever(FakeStore(["a"]), use_reranker=False)
+        retriever._bm25 = BM25Index([])
+        retriever._titles = []
+        result = ReActAgent(Mixed(), retriever, MemoryStore(":memory:")).run("Turing?", "s")
+        self.assertEqual(result.answer, "Turing broke Enigma [E1]")
+        self.assertTrue(result.corrected)
+
+
 class ParsingTests(unittest.TestCase):
+    def test_truncated_synthesis_json_is_hidden(self):
+        class Truncating(ScriptedLLM):
+            def chat(self, system, user, *, json_mode=False):
+                if "strictly from the numbered" in system:
+                    return '{"thinking": "x", "relevant_facts": ["Turing broke Enigma'
+                return super().chat(system, user, json_mode=json_mode)
+
+        retriever = HybridRetriever(FakeStore(["a"]), use_reranker=False)
+        retriever._bm25 = BM25Index([])
+        retriever._titles = []
+        agent = ReActAgent(Truncating(), retriever, MemoryStore(":memory:"), self_correct=False)
+        self.assertEqual(agent.run("Turing?", "s").answer, "I don't know")
+
+    def test_synthesis_without_answer_key_uses_facts(self):
+        class FactsOnly(ScriptedLLM):
+            def chat(self, system, user, *, json_mode=False):
+                if "strictly from the numbered" in system:
+                    return json.dumps({"thinking": "x", "relevant_facts": ["Turing broke Enigma [E1]"]})
+                return super().chat(system, user, json_mode=json_mode)
+
+        retriever = HybridRetriever(FakeStore(["a"]), use_reranker=False)
+        retriever._bm25 = BM25Index([])
+        retriever._titles = []
+        agent = ReActAgent(FactsOnly(), retriever, MemoryStore(":memory:"), self_correct=False)
+        self.assertEqual(agent.run("Turing?", "s").answer, "Turing broke Enigma [E1]")
+
     def test_parse_json_with_noise(self):
         self.assertEqual(parse_json('sure! {"a": 1} ok'), {"a": 1})
         self.assertIsNone(parse_json("no json"))
