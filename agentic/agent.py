@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 
 from agentic import prompts
-from agentic.hybrid import HybridRetriever, lookup_title
+from agentic.hybrid import HybridRetriever, lookup_title, tokenize
 from agentic.llm import LLM, parse_json
 from agentic.memory import MemoryStore
 from agentic.types import AgentResult, Hit, Step
@@ -19,6 +19,9 @@ from config import (
 _THINKING = re.compile(r"<thinking>(.*?)</thinking>", re.DOTALL | re.IGNORECASE)
 _ANSWER = re.compile(r"<answer>(.*?)(?:</answer>|$)", re.DOTALL | re.IGNORECASE)
 _MAX_EVIDENCE = 8
+_MAX_SEEDED_ENTITIES = 2
+_SEED_CHUNKS = 2
+_GROUNDING_THRESHOLD = 0.6
 _TOOLS = {"search_wiki", "lookup_entity", "final_answer"}
 
 
@@ -76,11 +79,12 @@ class ReActAgent:
         memory_ctx = self.memory.build_context(session_id)
         task, sub_questions = self._decompose(question, memory_ctx)
         book = EvidenceBook()
-        steps = self._react_loop(task, sub_questions, memory_ctx, book)
+        steps = self._seed_entities(f"{question} {task}", book)
+        steps = self._react_loop(task, sub_questions, memory_ctx, book, steps)
 
         thinking, draft = self._synthesize(task, sub_questions, book, memory_ctx)
         answer, corrected = draft, False
-        if self.self_correct and len(book) and not draft.startswith(prompts.NOT_FOUND):
+        if self.self_correct and len(book):
             answer, corrected = self._verify(task, draft, book)
 
         self._remember(session_id, question, answer, book)
@@ -106,11 +110,34 @@ class ReActAgent:
         cleaned = [str(s).strip() for s in subs if str(s).strip()][:MAX_SUB_QUESTIONS]
         return task, cleaned or [task]
 
+    def _seed_entities(self, text: str, book: EvidenceBook) -> list[Step]:
+        """Name-only searches rank article trivia as high as the intro, because every
+        chunk contains the name. So when the question names a known article, load its
+        opening chunks (definition, dates, main facts) before the loop starts."""
+        steps = []
+        for title in self.retriever.find_entities(text)[:_MAX_SEEDED_ENTITIES]:
+            hits = lookup_title(title, limit=_SEED_CHUNKS, exact=True)
+            if hits:
+                steps.append(
+                    Step(
+                        f"The question is about {title}; read the start of its article.",
+                        "lookup_entity",
+                        title,
+                        self._format_observation(book.add(hits)),
+                    )
+                )
+        return steps
+
     def _react_loop(
-        self, task: str, sub_questions: list[str], memory_ctx: str, book: EvidenceBook
+        self,
+        task: str,
+        sub_questions: list[str],
+        memory_ctx: str,
+        book: EvidenceBook,
+        steps: list[Step],
     ) -> list[Step]:
-        steps: list[Step] = []
-        tried: set[tuple[str, str]] = set()
+        steps = list(steps)
+        tried = {(s.action, s.action_input.lower()) for s in steps}
         for _ in range(self.max_steps):
             raw = self.llm.chat(
                 prompts.REACT_SYSTEM,
@@ -145,8 +172,12 @@ class ReActAgent:
             hits = self.retriever.search(arg, top_k=FINAL_TOP_K)
         if not hits:
             return "No results. Try different keywords or another tool."
+        return self._format_observation(book.add(hits))
+
+    @staticmethod
+    def _format_observation(numbered: list[tuple[int, Hit]]) -> str:
         return "\n".join(
-            f"[E{n}] ({h.title}) {h.text[:OBSERVATION_CHAR_LIMIT]}" for n, h in book.add(hits)
+            f"[E{n}] ({h.title}) {h.text[:OBSERVATION_CHAR_LIMIT]}" for n, h in numbered
         )
 
     def _synthesize(
@@ -157,18 +188,35 @@ class ReActAgent:
         raw = self.llm.chat(
             prompts.SYNTHESIS_SYSTEM,
             prompts.synthesis_user(task, sub_questions, book.render(), memory_ctx),
+            json_mode=True,  # 3B models skip free-text tags but keep JSON keys
         )
-        return parse_thinking_answer(raw)
+        data = parse_json(raw)
+        if data is None or not str(data.get("answer", "")).strip():
+            return parse_thinking_answer(raw)
+        facts = data.get("relevant_facts")
+        facts = [str(f) for f in facts] if isinstance(facts, list) else []
+        thinking = str(data.get("thinking", "")).strip()
+        if facts:
+            thinking += "\nRelevant facts:\n" + "\n".join(f"- {f}" for f in facts)
+        return thinking.strip(), str(data["answer"]).strip()
 
     def _verify(self, task: str, draft: str, book: EvidenceBook) -> tuple[str, bool]:
+        evidence = book.render()
         raw = self.llm.chat(
-            prompts.VERIFY_SYSTEM, prompts.verify_user(task, draft, book.render()), json_mode=True
+            prompts.VERIFY_SYSTEM, prompts.verify_user(task, draft, evidence), json_mode=True
         )
         data = parse_json(raw) or {}
         revised = str(data.get("final_answer") or "").strip()
-        if data.get("verdict") == "revise" and revised and revised != draft:
-            return revised, True
-        return draft, False
+        if data.get("verdict") != "revise" or not revised or revised == draft:
+            return draft, False
+        if is_refusal(revised):
+            # Only keep a downgrade to "I don't know" if the draft was not grounded.
+            if is_refusal(draft) or not is_grounded(draft, evidence):
+                return prompts.NOT_FOUND, not is_refusal(draft)
+            return draft, False
+        if not is_grounded(revised, evidence):  # verifier brought in outside knowledge
+            return draft, False
+        return revised, True
 
     # -- memory ---------------------------------------------------------------
     def _remember(self, session_id: str, question: str, answer: str, book: EvidenceBook) -> None:
@@ -190,6 +238,24 @@ class ReActAgent:
             f"Observation: {s.observation}"
             for i, s in enumerate(steps, 1)
         )
+
+
+def is_refusal(answer: str) -> bool:
+    return answer.strip().lower().startswith(prompts.NOT_FOUND.lower())
+
+
+_CITATION = re.compile(r"\[E[\d,\s\-E]*\]")
+
+
+def is_grounded(answer: str, evidence: str, threshold: float = _GROUNDING_THRESHOLD) -> bool:
+    """Cheap hallucination guard: most content words of the answer must occur in the
+    evidence. Catches a model answering from its own knowledge (e.g. "SpaceX" when the
+    evidence is about Burj Khalifa). Word-level, so paraphrases still pass."""
+    words = [w for w in tokenize(_CITATION.sub(" ", answer)) if len(w) > 3]
+    if not words:
+        return True
+    known = set(tokenize(evidence))
+    return sum(w in known for w in words) / len(words) >= threshold
 
 
 def parse_thinking_answer(raw: str) -> tuple[str, str]:

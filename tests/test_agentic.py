@@ -5,8 +5,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from agentic.agent import ReActAgent, parse_thinking_answer
-from agentic.hybrid import BM25Index, HybridRetriever, reciprocal_rank_fusion
+from unittest import mock
+
+from agentic import agent as agent_mod
+from agentic.agent import ReActAgent, is_grounded, parse_thinking_answer
+from agentic.hybrid import BM25Index, HybridRetriever, find_entities, reciprocal_rank_fusion
 from agentic.llm import parse_json
 from agentic.memory import MemoryStore
 from agentic.types import Hit
@@ -98,6 +101,7 @@ class AgentTests(unittest.TestCase):
     def test_full_loop_with_self_correction(self):
         retriever = HybridRetriever(FakeStore(["a"]), use_reranker=False)
         retriever._bm25 = BM25Index([])
+        retriever._titles = []
         mem = MemoryStore(":memory:")
         result = ReActAgent(ScriptedLLM(), retriever, mem).run("Turing?", "s")
         self.assertEqual(result.answer, "He broke Enigma [E1].")
@@ -113,8 +117,79 @@ class AgentTests(unittest.TestCase):
 
         retriever = HybridRetriever(Empty(), use_reranker=False)
         retriever._bm25 = BM25Index([])
+        retriever._titles = []
         result = ReActAgent(ScriptedLLM(), retriever, MemoryStore(":memory:")).run("?", "s")
         self.assertTrue(result.answer.startswith("I don't know"))
+
+
+class EntityTests(unittest.TestCase):
+    TITLES = [("Albert Einstein", "person"), ("Nikola Tesla", "person"),
+              ("Niagara Falls", "place"), ("Mount Everest", "place")]
+
+    def test_typo_tolerant_full_name(self):
+        self.assertEqual(find_entities("who is albert eistain", self.TITLES), ["Albert Einstein"])
+
+    def test_person_surname_only(self):
+        self.assertEqual(find_entities("what did tesla invent", self.TITLES), ["Nikola Tesla"])
+
+    def test_place_last_word_does_not_match(self):
+        self.assertEqual(find_entities("which falls are tallest", self.TITLES), [])
+
+    def test_unrelated_text(self):
+        self.assertEqual(find_entities("what is the weather today", self.TITLES), [])
+
+
+class SeedingTests(unittest.TestCase):
+    def test_intro_seeded_and_refusal_revised(self):
+        intro = Hit("person:Albert Einstein:0", "Albert Einstein was a physicist.", "Albert Einstein", "person")
+
+        class RefusingLLM(ScriptedLLM):
+            def chat(self, system, user, *, json_mode=False):
+                if "strictly from the numbered" in system:
+                    return "<thinking>x</thinking><answer>I don't know.</answer>"
+                if "fact-checker" in system:
+                    assert "Albert Einstein was a physicist." in user
+                    return json.dumps({"verdict": "revise", "final_answer": "A physicist [E1]."})
+                if "reasoning core" in system:
+                    return json.dumps({"thought": "enough", "action": "final_answer", "action_input": "done"})
+                return super().chat(system, user, json_mode=json_mode)
+
+        retriever = HybridRetriever(FakeStore([]), use_reranker=False)
+        retriever._bm25 = BM25Index([])
+        retriever._titles = [("Albert Einstein", "person")]
+        with mock.patch.object(agent_mod, "lookup_title", return_value=[intro]) as lookup:
+            result = ReActAgent(RefusingLLM(), retriever, MemoryStore(":memory:")).run("who is albert eistain", "s")
+        lookup.assert_called_once_with("Albert Einstein", limit=2, exact=True)
+        self.assertEqual(result.steps[0].action, "lookup_entity")
+        self.assertEqual(result.answer, "A physicist [E1].")
+        self.assertTrue(result.corrected)
+
+
+class GroundingTests(unittest.TestCase):
+    EVIDENCE = "[E1] (Burj Khalifa) The building opened in 2010 in Downtown Dubai."
+
+    def test_grounded_answer_passes(self):
+        self.assertTrue(is_grounded("Burj Khalifa opened in 2010 in Dubai [E1].", self.EVIDENCE))
+
+    def test_outside_knowledge_rejected(self):
+        self.assertFalse(is_grounded("Elon Musk founded SpaceX, Neuralink and SolarCity.", self.EVIDENCE))
+
+    def test_verifier_hallucination_is_discarded(self):
+        class HallucinatingVerifier(ScriptedLLM):
+            def chat(self, system, user, *, json_mode=False):
+                if "strictly from the numbered" in system:
+                    return json.dumps({"thinking": "nothing about Musk", "relevant_facts": [], "answer": "I don't know"})
+                if "fact-checker" in system:
+                    return json.dumps({"verdict": "revise", "final_answer": "Elon Musk founded SpaceX and Neuralink."})
+                return super().chat(system, user, json_mode=json_mode)
+
+        retriever = HybridRetriever(FakeStore(["b"]), use_reranker=False)
+        retriever._bm25 = BM25Index([])
+        retriever._titles = []
+        result = ReActAgent(HallucinatingVerifier(), retriever, MemoryStore(":memory:")).run("Who is Elon Musk?", "s")
+        self.assertEqual(result.answer, "I don't know")
+        self.assertFalse(result.corrected)
+        self.assertIn("nothing about Musk", result.thinking)
 
 
 class ParsingTests(unittest.TestCase):

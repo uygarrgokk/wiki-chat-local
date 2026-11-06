@@ -7,7 +7,12 @@ Given the user's question (and optional conversation memory), output JSON only:
 {"standalone_question": "...", "sub_questions": ["...", "..."]}
 Rules:
 - standalone_question: rewrite the question so it needs no memory (resolve "he", "it", "there" using the memory). Keep the user's language.
-- sub_questions: 1 to 3 short, independent questions that together answer it. Use 1 for simple questions. Write them in English, as they would appear in an English Wikipedia article.
+- sub_questions: short questions in English that together answer it. Fix misspelled names.
+- Use exactly ONE sub-question for simple questions such as "who is X", "what is X", "where is X", "when was X born". Do not invent extra aspects the user did not ask for.
+- Use 2 or 3 sub-questions only when the question asks several things or compares entities.
+Examples:
+"who is albert eistain" -> {"standalone_question": "Who is Albert Einstein?", "sub_questions": ["Who is Albert Einstein?"]}
+"compare the heights of Burj Khalifa and Eiffel Tower" -> {"standalone_question": "Compare the heights of Burj Khalifa and Eiffel Tower.", "sub_questions": ["How tall is Burj Khalifa?", "How tall is the Eiffel Tower?"]}
 """
 
 REACT_SYSTEM = """You are the reasoning core of a local Wikipedia assistant. You solve the task step by step by choosing ONE action per turn.
@@ -28,18 +33,21 @@ Rules:
 
 SYNTHESIS_SYSTEM = f"""You answer questions strictly from the numbered EVIDENCE taken from a local Wikipedia corpus.
 
-Output format (mandatory):
-<thinking>
-Step-by-step analysis: restate the question, go through each sub-question, quote which evidence number [E#] supports each fact, note contradictions or gaps.
-</thinking>
-<answer>
-The final answer, concise and factual, citing evidence like [E2]. Reply in the user's language.
-</answer>
+Think first, then answer. Output JSON only:
+{{"thinking": "step-by-step: what the question asks, which evidence is relevant, what is missing",
+  "relevant_facts": ["fact copied from the evidence [E#]", "..."],
+  "answer": "reply for the user, 2-5 sentences, citing [E#]"}}
 
-Hard limits:
+Example (different topic):
+{{"thinking": "The question asks what the Eiffel Tower is and when it was built. E1 describes it, E3 gives the construction dates. E2 is about tourism and not needed.",
+  "relevant_facts": ["wrought-iron lattice tower in Paris [E1]", "built from 1887 to 1889 [E3]"],
+  "answer": "The Eiffel Tower is a wrought-iron lattice tower in Paris [E1], built between 1887 and 1889 [E3]."}}
+
+Rules:
+- "answer" contains no analysis and no talk about "the evidence". Reply in the user's language.
 - Use ONLY the evidence. No outside knowledge, no guessing.
-- If the evidence does not contain the answer, the answer must be exactly: {NOT_FOUND}. You may then add one sentence saying what is missing.
-- If only part of the question is covered, answer that part and state clearly which part is not in the Wikipedia data.
+- Answer with every relevant fact the evidence gives, even if some sub-questions stay unanswered. Then add one sentence naming what the Wikipedia data does not say.
+- Reply exactly "{NOT_FOUND}" only when NONE of the evidence is about the question.
 """
 
 VERIFY_SYSTEM = f"""You are a strict fact-checker. Compare the DRAFT ANSWER with the EVIDENCE.
@@ -48,6 +56,8 @@ Output JSON only:
 Rules:
 - verdict "ok" only if every claim in the draft is supported by the evidence and the draft addresses the question.
 - Otherwise verdict "revise" and write final_answer: the draft with unsupported claims removed or corrected, using only the evidence. If nothing is supported, final_answer = "{NOT_FOUND}".
+- If the draft says "{NOT_FOUND}" but the evidence DOES answer the question (fully or partly), verdict "revise" and write that answer in final_answer using sentences from the evidence. Never add facts that are not written in the evidence.
+- final_answer is text for the user: no analysis, no talk about "the draft".
 - Keep the draft's language and its [E#] citations.
 """
 
@@ -75,9 +85,14 @@ def synthesis_user(task: str, sub_questions: list[str], evidence: str, memory: s
     return (
         f"Conversation memory:\n{memory or '(none)'}\n\n"
         f"Question: {task}\nSub-questions:\n{subs}\n\n"
-        f"EVIDENCE:\n{evidence or '(no evidence found)'}"
+        f"EVIDENCE:\n{evidence or '(no evidence found)'}\n\n"
+        # Repeated after the evidence: small models lose the question in long context.
+        f"Now answer this question from the evidence above: {task}"
     )
 
 
 def verify_user(task: str, draft: str, evidence: str) -> str:
-    return f"Question: {task}\n\nEVIDENCE:\n{evidence or '(none)'}\n\nDRAFT ANSWER:\n{draft}"
+    return (
+        f"EVIDENCE:\n{evidence or '(none)'}\n\n"
+        f"Question: {task}\n\nDRAFT ANSWER:\n{draft}"
+    )

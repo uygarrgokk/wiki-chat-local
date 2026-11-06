@@ -5,6 +5,7 @@ import math
 import re
 import sqlite3
 from collections import Counter, defaultdict
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Iterable
 
@@ -122,10 +123,17 @@ class HybridRetriever:
             reranker = Reranker()
         self.reranker = reranker
         self._bm25: BM25Index | None = None
+        self._titles: list[tuple[str, str]] | None = None
 
     def refresh(self) -> None:
-        """Drop the BM25 index; call after /ingest or /reset."""
+        """Drop cached indexes; call after /ingest or /reset."""
         self._bm25 = None
+        self._titles = None
+
+    def find_entities(self, text: str) -> list[str]:
+        if self._titles is None:
+            self._titles = load_titles()
+        return find_entities(text, self._titles)
 
     def _load_bm25(self) -> BM25Index:
         if self._bm25 is None:
@@ -181,7 +189,49 @@ def load_chunks(db_path: Path = SQLITE_PATH) -> list[Hit]:
     return _query_hits(_CHUNK_SELECT, (), db_path)
 
 
-def lookup_title(title: str, limit: int = 3, db_path: Path = SQLITE_PATH) -> list[Hit]:
-    """SQLite tool: first chunks of documents whose title matches `title`."""
-    sql = _CHUNK_SELECT + " WHERE lower(c.title) LIKE ? ORDER BY c.title, c.chunk_index LIMIT ?"
-    return _query_hits(sql, (f"%{title.lower().strip()}%", limit), db_path)
+def lookup_title(
+    title: str, limit: int = 3, db_path: Path = SQLITE_PATH, *, exact: bool = False
+) -> list[Hit]:
+    """SQLite tool: opening chunks of documents whose title matches `title`."""
+    if exact:
+        where, param = "lower(c.title) = ?", title.lower().strip()
+    else:
+        where, param = "lower(c.title) LIKE ?", f"%{title.lower().strip()}%"
+    sql = _CHUNK_SELECT + f" WHERE {where} ORDER BY c.title, c.chunk_index LIMIT ?"
+    return _query_hits(sql, (param, limit), db_path)
+
+
+def load_titles(db_path: Path = SQLITE_PATH) -> list[tuple[str, str]]:
+    if not Path(db_path).exists():
+        return []
+    conn = sqlite3.connect(db_path)
+    try:
+        return conn.execute("SELECT title, entity_type FROM docs").fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
+
+
+def find_entities(
+    text: str, titles: list[tuple[str, str]], cutoff: float = 0.8
+) -> list[str]:
+    """Fuzzy-match document titles mentioned in `text` (tolerates typos like "eistain").
+
+    Compares each title against word windows of the same length; for people the
+    surname alone also counts ("who was tesla"). Best matches first.
+    """
+    words = _TOKEN.findall(text.lower())
+    found: dict[str, float] = {}
+    for title, entity_type in titles:
+        t_words = title.lower().split()
+        candidates = [(title.lower(), len(t_words))]
+        if entity_type == "person" and len(t_words) > 1 and len(t_words[-1]) >= 5:
+            candidates.append((t_words[-1], 1))
+        for target, n in candidates:
+            for i in range(len(words) - n + 1):
+                window = " ".join(words[i : i + n])
+                ratio = SequenceMatcher(None, window, target).ratio()
+                if ratio >= cutoff and ratio > found.get(title, 0):
+                    found[title] = ratio
+    return sorted(found, key=found.__getitem__, reverse=True)
