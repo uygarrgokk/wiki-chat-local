@@ -3,3 +3,5 @@ sentence-transformers
 requests
 ollama
 tqdm
+# Agentic RAG: BM25, RRF and the cross-encoder reranker need no extra packages
+# (BM25 is implemented in agentic/hybrid.py; CrossEncoder ships with sentence-transformers).
